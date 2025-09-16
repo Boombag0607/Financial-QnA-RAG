@@ -203,5 +203,3 @@ Educational use only. SEC data is public domain. Vector Store (`VectorStore`)
 ```
 "How much did Microsoft's cloud revenue grow from 2022 to 2023?"
 ```
-
-### 3.
