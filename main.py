@@ -13,6 +13,7 @@ from pathlib import Path
 import time
 from urllib.parse import urljoin
 import pickle
+from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Document:
-    """Document chunk with metadata"""
+    """Document chunk with metadata and HTML awareness"""
     content: str
     company: str
     year: str
@@ -30,7 +31,7 @@ class Document:
 
 @dataclass
 class QueryResult:
-    """Result from a query with sources"""
+    """Result from a query with enhanced source attribution"""
     query: str
     answer: str
     reasoning: str
@@ -38,7 +39,7 @@ class QueryResult:
     sources: List[Dict[str, Any]]
 
 class SECDataCollector:
-    """Collects 10-K filings from SEC EDGAR database"""
+    """Collects 10-K filings from SEC EDGAR database with HTML focus"""
     
     BASE_URL = "https://www.sec.gov/Archives/edgar/data/"
     HEADERS = {
@@ -51,9 +52,9 @@ class SECDataCollector:
         'NVDA': '1045810'
     }
     
-    def __init__(self, data_dir: str = "sec_data"):
+    def __init__(self, data_dir: str = "data/sec_filings"):
         self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(exist_ok=True)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         
     def get_company_filings(self, cik: str, filing_type: str = "10-K") -> List[Dict]:
         """Get filing information for a company"""
@@ -88,7 +89,7 @@ class SECDataCollector:
     
     def download_filing(self, cik: str, accession_number: str, primary_document: str, 
                        company: str, year: int) -> Optional[str]:
-        """Download a specific filing"""
+        """Download a specific filing in HTML format"""
         # Clean accession number for URL
         clean_accession = accession_number.replace('-', '')
         url = f"{self.BASE_URL}{cik}/{clean_accession}/{primary_document}"
@@ -97,7 +98,7 @@ class SECDataCollector:
         filepath = self.data_dir / filename
         
         if filepath.exists():
-            logger.info(f"File already exists: {filepath}")
+            logger.info(f"HTML file already exists: {filepath}")
             return str(filepath)
         
         try:
@@ -107,7 +108,7 @@ class SECDataCollector:
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(response.text)
             
-            logger.info(f"Downloaded: {filepath}")
+            logger.info(f"Downloaded HTML filing: {filepath}")
             time.sleep(1)  # Be respectful to SEC servers
             return str(filepath)
             
@@ -116,11 +117,11 @@ class SECDataCollector:
             return None
     
     def collect_all_filings(self) -> Dict[str, List[str]]:
-        """Collect all required filings"""
+        """Collect all required filings in HTML format"""
         all_files = {}
         
         for company, cik in self.COMPANY_CIKS.items():
-            logger.info(f"Collecting filings for {company}")
+            logger.info(f"Collecting HTML filings for {company}")
             filings = self.get_company_filings(cik)
             company_files = []
             
@@ -140,7 +141,7 @@ class SECDataCollector:
         return all_files
 
 class DocumentProcessor:
-    """Processes SEC filings and creates document chunks"""
+    """Enhanced HTML document processor with table extraction capabilities"""
     
     def __init__(self):
         self.financial_sections = [
@@ -149,76 +150,209 @@ class DocumentProcessor:
             "revenue", "operating income", "net income", "gross profit",
             "operating margin", "data center", "cloud", "azure", "gcp", "aws"
         ]
-    
-    def extract_text_from_html(self, filepath: str) -> str:
-        """Extract text from HTML filing"""
+        
+        # HTML table patterns for financial data
+        self.table_indicators = [
+            "consolidated statements", "income statement", "balance sheet",
+            "cash flow", "revenue", "expenses", "assets", "liabilities",
+            "fiscal year", "three months ended", "year ended"
+        ]
+        
+    def extract_html_content(self, filepath: str) -> dict:
+        """Extract structured content from HTML filing preserving table structure"""
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
+                html_content = f.read()
             
-            # Simple HTML cleaning - remove scripts, styles
-            content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
-            content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
+            soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Remove HTML tags
-            content = re.sub(r'<[^>]+>', ' ', content)
+            # Remove scripts and styles but keep structure
+            for script in soup(["script", "style"]):
+                script.decompose()
             
-            # Clean up whitespace
-            content = re.sub(r'\s+', ' ', content)
-            content = re.sub(r'\n+', '\n', content)
+            content_parts = {
+                'text_content': '',
+                'tables': [],
+                'raw_html': html_content[:50000]  # Keep first 50k chars for context
+            }
             
-            return content.strip()
+            # Extract tables with context
+            tables = soup.find_all('table')
+            logger.info(f"Found {len(tables)} tables in HTML document")
+            
+            for i, table in enumerate(tables):
+                table_text = self._extract_table_content(table)
+                if self._is_financial_table(table_text):
+                    content_parts['tables'].append({
+                        'table_id': i,
+                        'content': table_text,
+                        'html': str(table)[:2000],  # First 2000 chars of table HTML
+                        'type': self._classify_table_type(table_text)
+                    })
+            
+            # Extract regular text content (non-table)
+            for table in soup.find_all('table'):
+                table.decompose()  # Remove tables from text extraction
+            
+            content_parts['text_content'] = soup.get_text(separator=' ', strip=True)
+            
+            return content_parts
             
         except Exception as e:
-            logger.error(f"Error extracting text from {filepath}: {e}")
-            return ""
+            logger.error(f"Error extracting HTML content from {filepath}: {e}")
+            return {'text_content': '', 'tables': [], 'raw_html': ''}
     
-    def is_financial_relevant(self, text: str) -> bool:
-        """Check if text chunk contains financial information"""
-        text_lower = text.lower()
-        return any(keyword in text_lower for keyword in self.financial_sections)
+    def _extract_table_content(self, table) -> str:
+        """Extract meaningful content from HTML table"""
+        rows = []
+        
+        for row in table.find_all('tr'):
+            cells = []
+            for cell in row.find_all(['td', 'th']):
+                cell_text = cell.get_text(strip=True)
+                if cell_text:
+                    cells.append(cell_text)
+            
+            if cells:  # Only add non-empty rows
+                rows.append(' | '.join(cells))
+        
+        return '\n'.join(rows)
     
-    def create_chunks(self, text: str, company: str, year: str, 
-                     chunk_size: int = 800, overlap: int = 100) -> List[Document]:
-        """Create overlapping text chunks"""
-        words = text.split()
+    def _is_financial_table(self, table_content: str) -> bool:
+        """Determine if table contains financial data"""
+        content_lower = table_content.lower()
+        
+        # Look for financial indicators
+        financial_indicators = [
+            'revenue', 'income', 'expense', 'margin', 'profit', 'loss',
+            'assets', 'liabilities', 'equity', 'cash', 'million', 'billion',
+            '$', 'fiscal', 'quarter', 'year ended', 'three months'
+        ]
+        
+        indicator_count = sum(1 for indicator in financial_indicators 
+                            if indicator in content_lower)
+        
+        # Also check for numerical patterns
+        number_patterns = len(re.findall(r'\$?[\d,]+\.?\d*', table_content))
+        
+        return indicator_count >= 2 and number_patterns >= 3
+    
+    def _classify_table_type(self, table_content: str) -> str:
+        """Classify the type of financial table"""
+        content_lower = table_content.lower()
+        
+        if any(term in content_lower for term in ['income statement', 'operations', 'revenue', 'operating income']):
+            return 'income_statement'
+        elif any(term in content_lower for term in ['balance sheet', 'assets', 'liabilities']):
+            return 'balance_sheet'
+        elif any(term in content_lower for term in ['cash flow', 'cash flows', 'operating activities']):
+            return 'cash_flow'
+        elif any(term in content_lower for term in ['segment', 'revenue by', 'geographic']):
+            return 'segment_data'
+        else:
+            return 'financial_data'
+    
+    def create_html_aware_chunks(self, content_parts: dict, company: str, year: str,
+                               chunk_size: int = 1000, overlap: int = 150) -> List[Document]:
+        """Create chunks that preserve HTML table structure and context"""
         chunks = []
         
-        for i in range(0, len(words), chunk_size - overlap):
-            chunk_words = words[i:i + chunk_size]
-            chunk_text = ' '.join(chunk_words)
+        # Process tables as separate chunks (they're highly structured)
+        for table_info in content_parts['tables']:
+            table_content = f"""
+            Financial Table - {table_info['type'].replace('_', ' ').title()}
+            Company: {company} | Year: {year}
             
-            # Only keep chunks that seem financially relevant
-            if len(chunk_text.strip()) > 100 and self.is_financial_relevant(chunk_text):
+            Table Data:
+            {table_info['content']}
+            
+            HTML Structure Context:
+            {table_info['html'][:500]}...
+            """
+            
+            if len(table_content.strip()) > 100:
                 doc = Document(
-                    content=chunk_text,
+                    content=table_content,
                     company=company,
                     year=year,
-                    chunk_id=f"{company}_{year}_{i//chunk_size}"
+                    section=f"table_{table_info['table_id']}",
+                    chunk_id=f"{company}_{year}_table_{table_info['table_id']}"
                 )
                 chunks.append(doc)
         
+        # Process regular text content in overlapping chunks
+        text_content = content_parts['text_content']
+        if text_content:
+            words = text_content.split()
+            
+            for i in range(0, len(words), chunk_size - overlap):
+                chunk_words = words[i:i + chunk_size]
+                chunk_text = ' '.join(chunk_words)
+                
+                if len(chunk_text.strip()) > 100 and self.is_financial_relevant(chunk_text):
+                    # Add HTML context for better understanding
+                    enhanced_content = f"""
+                    Text Content - {company} {year}
+                    
+                    {chunk_text}
+                    
+                    [Document contains {len(content_parts['tables'])} financial tables]
+                    """
+                    
+                    doc = Document(
+                        content=enhanced_content,
+                        company=company,
+                        year=year,
+                        section="narrative_text",
+                        chunk_id=f"{company}_{year}_text_{i//chunk_size}"
+                    )
+                    chunks.append(doc)
+        
         return chunks
     
+    def is_financial_relevant(self, text: str) -> bool:
+        """Enhanced financial relevance check"""
+        text_lower = text.lower()
+        
+        # Original keyword check
+        keyword_match = any(keyword in text_lower for keyword in self.financial_sections)
+        
+        # Check for financial numbers
+        has_financial_numbers = bool(re.search(r'\$[\d,]+\.?\d*\s*(million|billion|thousand)', text_lower))
+        
+        # Check for percentage metrics
+        has_percentages = bool(re.search(r'\d+\.?\d*%', text))
+        
+        return keyword_match or has_financial_numbers or has_percentages
+    
     def process_filing(self, filepath: str) -> List[Document]:
-        """Process a single filing into document chunks"""
+        """Process a single HTML filing into document chunks with table awareness"""
         # Extract company and year from filename
         filename = Path(filepath).stem  # e.g., "GOOGL_2023_10K"
         parts = filename.split('_')
         company = parts[0]
         year = parts[1]
         
-        text = self.extract_text_from_html(filepath)
-        if not text:
+        logger.info(f"Processing HTML filing: {filepath}")
+        
+        # Extract HTML content with table structure
+        content_parts = self.extract_html_content(filepath)
+        
+        if not content_parts['text_content'] and not content_parts['tables']:
+            logger.warning(f"No content extracted from {filepath}")
             return []
         
-        chunks = self.create_chunks(text, company, year)
-        logger.info(f"Created {len(chunks)} chunks for {company} {year}")
+        # Create HTML-aware chunks
+        chunks = self.create_html_aware_chunks(content_parts, company, year)
+        
+        logger.info(f"Created {len(chunks)} chunks for {company} {year} "
+                   f"({len(content_parts['tables'])} table chunks, "
+                   f"{len(chunks) - len(content_parts['tables'])} text chunks)")
         
         return chunks
 
 class VectorStore:
-    """Simple FAISS-based vector store"""
+    """Enhanced FAISS-based vector store with table awareness"""
     
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         self.encoder = SentenceTransformer(model_name)
@@ -228,8 +362,15 @@ class VectorStore:
         self.dimension = None
     
     def add_documents(self, documents: List[Document]):
-        """Add documents to the vector store"""
+        """Add documents to the vector store with enhanced indexing"""
         logger.info(f"Adding {len(documents)} documents to vector store")
+        
+        # Separate table and text documents for enhanced processing
+        table_docs = [doc for doc in documents if 'table_' in doc.chunk_id]
+        text_docs = [doc for doc in documents if 'table_' not in doc.chunk_id]
+        
+        logger.info(f"  - {len(table_docs)} table documents")
+        logger.info(f"  - {len(text_docs)} text documents")
         
         self.documents.extend(documents)
         
@@ -250,8 +391,8 @@ class VectorStore:
         logger.info(f"Vector store now contains {len(self.documents)} documents")
     
     def search(self, query: str, k: int = 5, company_filter: str = None, 
-               year_filter: str = None) -> List[Tuple[Document, float]]:
-        """Search for relevant documents"""
+               year_filter: str = None, prefer_tables: bool = False) -> List[Tuple[Document, float]]:
+        """Enhanced search with table preference option"""
         if self.index is None:
             return []
         
@@ -259,9 +400,9 @@ class VectorStore:
         query_embedding = self.encoder.encode([query])
         faiss.normalize_L2(query_embedding)
         
-        # Search
-        scores, indices = self.index.search(query_embedding.astype('float32'), 
-                                          min(k * 3, len(self.documents)))
+        # Search for more results initially if we need to filter
+        search_k = min(k * 3, len(self.documents))
+        scores, indices = self.index.search(query_embedding.astype('float32'), search_k)
         
         # Filter and rank results
         results = []
@@ -275,12 +416,19 @@ class VectorStore:
                 if year_filter and doc.year != year_filter:
                     continue
                 
-                results.append((doc, float(score)))
+                # Boost table documents if preferred
+                final_score = float(score)
+                if prefer_tables and 'table_' in doc.chunk_id:
+                    final_score *= 1.2
+                
+                results.append((doc, final_score))
         
+        # Sort by final score and return top k
+        results.sort(key=lambda x: x[1], reverse=True)
         return results[:k]
 
 class FinancialAgent:
-    """Agent for query decomposition and multi-step reasoning"""
+    """Enhanced agent for HTML-aware financial analysis with advanced table processing"""
     
     def __init__(self, vector_store: VectorStore):
         self.vector_store = vector_store
@@ -288,7 +436,7 @@ class FinancialAgent:
         self.companies = ['GOOGL', 'MSFT', 'NVDA']
         self.years = ['2022', '2023', '2024']
         
-        # Patterns for query decomposition
+        # Enhanced patterns for HTML-aware queries
         self.comparison_patterns = [
             r'compare.*across.*companies',
             r'which company.*highest|lowest',
@@ -297,14 +445,17 @@ class FinancialAgent:
             r'between.*and.*'
         ]
         
+        # Enhanced metrics with table-specific patterns
         self.metrics = {
-            'revenue': ['revenue', 'net revenues', 'total revenue'],
-            'operating_margin': ['operating margin', 'operating income margin'],
+            'revenue': ['revenue', 'net revenues', 'total revenue', 'sales'],
+            'operating_margin': ['operating margin', 'operating income margin', 'margin from operations'],
             'gross_margin': ['gross margin', 'gross profit margin'], 
             'rd_spending': ['research and development', 'r&d', 'research & development'],
-            'cloud_revenue': ['cloud', 'azure', 'google cloud', 'gcp', 'aws'],
+            'cloud_revenue': ['cloud', 'azure', 'google cloud', 'gcp', 'aws', 'cloud services'],
             'data_center': ['data center', 'datacenter', 'compute'],
-            'advertising': ['advertising', 'ads', 'search advertising']
+            'advertising': ['advertising', 'ads', 'search advertising'],
+            'total_assets': ['total assets', 'assets'],
+            'cash': ['cash and cash equivalents', 'cash', 'liquid assets']
         }
     
     def needs_decomposition(self, query: str) -> bool:
@@ -390,41 +541,86 @@ class FinancialAgent:
         
         return sub_queries if sub_queries else [query]
     
-    def execute_query(self, query: str, k: int = 3) -> List[Tuple[Document, float]]:
-        """Execute a single query against vector store"""
-        return self.vector_store.search(query, k=k)
+    def enhanced_query_search(self, query: str, k: int = 5) -> List[Tuple[Document, float]]:
+        """Enhanced search that prioritizes table content for structured queries"""
+        # Check if this is a numerical query that would benefit from table data
+        prefer_tables = self._is_numerical_query(query)
+        
+        # Use enhanced search with table preference
+        return self.vector_store.search(query, k=k, prefer_tables=prefer_tables)
     
-    def synthesize_answer(self, query: str, sub_queries: List[str], 
-                         all_results: List[List[Tuple[Document, float]]]) -> str:
-        """Synthesize final answer from multiple retrieval results"""
+    def _is_numerical_query(self, query: str) -> bool:
+        """Check if query is asking for numerical/tabular data"""
+        numerical_indicators = [
+            'revenue', 'margin', 'income', 'profit', 'loss', 'assets', 'cash',
+            'percentage', '%', 'billion', 'million', 'growth', 'compare',
+            'highest', 'lowest', 'total', 'expenses', 'breakdown', 'segment'
+        ]
         
-        # Collect all relevant information
-        all_info = {}
-        
-        for sub_query, results in zip(sub_queries, all_results):
-            for doc, score in results:
-                key = f"{doc.company}_{doc.year}"
-                if key not in all_info:
-                    all_info[key] = []
-                
-                # Extract relevant snippets
-                snippet = self.extract_relevant_snippet(sub_query, doc.content)
-                if snippet:
-                    all_info[key].append({
-                        'content': snippet,
-                        'score': score,
-                        'sub_query': sub_query
-                    })
-        
-        # Generate answer based on query type
         query_lower = query.lower()
+        return any(indicator in query_lower for indicator in numerical_indicators)
+    
+    def extract_table_values(self, content: str, metric_type: str) -> dict:
+        """Enhanced extraction from HTML table content"""
+        results = {}
         
-        if 'compare' in query_lower or 'which company' in query_lower:
-            return self.generate_comparison_answer(query, all_info)
-        elif 'grow' in query_lower or 'growth' in query_lower:
-            return self.generate_growth_answer(query, all_info)
-        else:
-            return self.generate_simple_answer(query, all_info)
+        # Table-specific patterns that work with HTML structure
+        table_patterns = {
+            'revenue': [
+                r'(?:total\s+)?(?:net\s+)?revenues?\s*[|:]\s*\$?([\d,]+\.?\d*)',
+                r'(?:net\s+)?revenues?\s*\$?([\d,]+\.?\d*)\s*(?:million|billion)',
+                r'revenues?\s*[|]\s*\$?([\d,]+\.?\d*)'
+            ],
+            'operating_margin': [
+                r'operating\s+margin\s*[|:]\s*(\d+\.?\d*)%',
+                r'margin\s*[|]\s*(\d+\.?\d*)%',
+                r'(\d+\.?\d*)%\s*[|]\s*operating'
+            ],
+            'rd_spending': [
+                r'research\s+(?:and\s+)?development\s*[|:]\s*\$?([\d,]+\.?\d*)',
+                r'r&d\s*[|:]\s*\$?([\d,]+\.?\d*)',
+                r'(\d+\.?\d*)%?\s*[|]\s*research'
+            ],
+            'cloud_revenue': [
+                r'cloud\s*(?:services)?\s*[|:]\s*\$?([\d,]+\.?\d*)',
+                r'azure\s*[|:]\s*\$?([\d,]+\.?\d*)',
+                r'(?:google\s+)?cloud\s*[|]\s*\$?([\d,]+\.?\d*)'
+            ],
+            'data_center': [
+                r'data\s+center\s*[|:]\s*\$?([\d,]+\.?\d*)',
+                r'datacenter\s*[|:]\s*\$?([\d,]+\.?\d*)'
+            ]
+        }
+        
+        patterns = table_patterns.get(metric_type, [])
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE | re.MULTILINE)
+            if matches:
+                # Clean and convert the first match
+                value_str = matches[0].replace(',', '')
+                try:
+                    if '%' in pattern:
+                        results['value'] = float(value_str)
+                        results['type'] = 'percentage'
+                    else:
+                        results['value'] = float(value_str)
+                        results['type'] = 'currency'
+                        
+                        # Detect units from context
+                        if 'billion' in content.lower():
+                            results['unit'] = 'billion'
+                        elif 'million' in content.lower():
+                            results['unit'] = 'million'
+                        else:
+                            results['unit'] = 'unknown'
+                    
+                    results['raw_match'] = matches[0]
+                    break
+                except ValueError:
+                    continue
+        
+        return results
     
     def extract_relevant_snippet(self, query: str, content: str, 
                                max_length: int = 200) -> str:
@@ -450,250 +646,118 @@ class FinancialAgent:
         
         return best_sentence[:max_length] if best_sentence else content[:max_length]
     
-    def generate_comparison_answer(self, query: str, all_info: Dict) -> str:
-        """Generate answer for comparison queries"""
-        if not all_info:
-            return "Unable to find sufficient information to make comparison."
+    def synthesize_table_answer(self, query: str, sub_queries: List[str],
+                              all_results: List[List[Tuple[Document, float]]]) -> str:
+        """Enhanced synthesis that leverages table structure"""
         
-        # Extract company performance from collected info
-        companies_data = {}
+        # Collect structured data from tables
+        structured_data = {}
         
-        for key, info_list in all_info.items():
-            company, year = key.split('_')
+        for sub_query, results in zip(sub_queries, all_results):
+            # Extract metric type from sub-query
+            metric_type = self._extract_metric_type(sub_query)
             
-            if company not in companies_data:
-                companies_data[company] = {}
-            
-            # Look for numerical values in the content
-            for info in info_list:
-                content = info['content']
-                # Simple extraction of percentages and numbers
-                numbers = re.findall(r'(\d+\.?\d*)%?', content)
-                if numbers:
-                    companies_data[company][year] = {
-                        'value': numbers[0],
-                        'context': content[:100]
-                    }
-        
-        # Generate comparison
-        if companies_data:
-            answer_parts = []
-            for company, data in companies_data.items():
-                if data:
-                    year_data = list(data.values())[0]  # Get first available year
-                    answer_parts.append(f"{company}: {year_data['value']}")
-            
-            if answer_parts:
-                return f"Based on available data: {', '.join(answer_parts)}"
-        
-        return "Found relevant information but unable to extract specific comparison values."
-    
-    def generate_growth_answer(self, query: str, all_info: Dict) -> str:
-        """Generate answer for growth/change queries"""
-        if not all_info:
-            return "Unable to find sufficient information to calculate growth."
-        
-        # Look for data from different years
-        company_years = {}
-        
-        for key, info_list in all_info.items():
-            company, year = key.split('_')
-            if company not in company_years:
-                company_years[company] = {}
-                
-            for info in info_list:
-                content = info['content']
-                numbers = re.findall(r'(\d+\.?\d*)', content)
-                if numbers:
-                    company_years[company][year] = {
-                        'value': float(numbers[0]),
-                        'context': content[:100]
-                    }
-        
-        # Calculate growth if we have multiple years
-        for company, years_data in company_years.items():
-            if len(years_data) >= 2:
-                years = sorted(years_data.keys())
-                start_value = years_data[years[0]]['value']
-                end_value = years_data[years[-1]]['value']
-                
-                if start_value > 0:
-                    growth_pct = ((end_value - start_value) / start_value) * 100
-                    return f"{company} grew from {start_value} to {end_value} ({growth_pct:.1f}% growth) from {years[0]} to {years[-1]}"
-        
-        return "Found relevant information but unable to calculate specific growth rate."
-    
-    def generate_simple_answer(self, query: str, all_info: Dict) -> str:
-        """Generate answer for simple queries"""
-        if not all_info:
-            return "No relevant information found."
-        
-        # Get the best matching information
-        best_info = None
-        best_score = 0
-        
-        for key, info_list in all_info.items():
-            for info in info_list:
-                if info['score'] > best_score:
-                    best_score = info['score']
-                    best_info = info
-        
-        if best_info:
-            return f"Based on the filing: {best_info['content']}"
-        
-        return "Found some relevant information but unable to provide specific answer."
-    
-    def process_query(self, query: str) -> QueryResult:
-        """Main method to process a query with agent capabilities"""
-        logger.info(f"Processing query: {query}")
-        
-        # Determine if decomposition is needed
-        if self.needs_decomposition(query):
-            logger.info("Query requires decomposition")
-            sub_queries = self.decompose_query(query)
-        else:
-            logger.info("Simple query, no decomposition needed")
-            sub_queries = [query]
-        
-        logger.info(f"Sub-queries: {sub_queries}")
-        
-        # Execute all sub-queries
-        all_results = []
-        all_sources = []
-        
-        for sub_query in sub_queries:
-            results = self.execute_query(sub_query, k=3)
-            all_results.append(results)
-            
-            # Collect sources
             for doc, score in results:
-                source = {
-                    "company": doc.company,
-                    "year": doc.year, 
-                    "excerpt": doc.content[:200] + "...",
-                    "score": round(score, 3),
-                    "chunk_id": doc.chunk_id
-                }
-                all_sources.append(source)
+                company = doc.company
+                year = doc.year
+                
+                key = f"{company}_{year}"
+                
+                if key not in structured_data:
+                    structured_data[key] = {}
+                
+                # Use enhanced table extraction
+                if 'table_' in doc.chunk_id:
+                    table_values = self.extract_table_values(doc.content, metric_type)
+                    if table_values:
+                        structured_data[key][metric_type] = table_values
+                        structured_data[key][metric_type]['source_type'] = 'table'
+                        structured_data[key][metric_type]['confidence'] = score * 1.2
+                else:
+                    # Fallback to regular text extraction
+                    snippet = self.extract_relevant_snippet(sub_query, doc.content)
+                    if snippet:
+                        structured_data[key][metric_type] = {
+                            'content': snippet,
+                            'source_type': 'text',
+                            'confidence': score
+                        }
         
-        # Remove duplicate sources
-        unique_sources = []
-        seen_chunks = set()
-        for source in all_sources:
-            if source["chunk_id"] not in seen_chunks:
-                unique_sources.append(source)
-                seen_chunks.add(source["chunk_id"])
-        
-        # Synthesize final answer
-        answer = self.synthesize_answer(query, sub_queries, all_results)
-        
-        reasoning = f"Executed {len(sub_queries)} sub-queries and synthesized results from {len(unique_sources)} document chunks."
-        
-        return QueryResult(
-            query=query,
-            answer=answer,
-            reasoning=reasoning,
-            sub_queries=sub_queries,
-            sources=unique_sources[:5]  # Limit to top 5 sources
-        )
-
-def main():
-    """Main execution function"""
-    print("🏦 Financial RAG System with Agent Capabilities")
-    print("=" * 50)
+        # Generate analysis based on structured data
+        return self._generate_structured_analysis(query, structured_data)
     
-    # Test queries
-    test_queries = [
-        "What was NVIDIA's total revenue in fiscal year 2024?",
-        "What percentage of Google's 2023 revenue came from advertising?",
-        "How much did Microsoft's cloud revenue grow from 2022 to 2023?",
-        "Which of the three companies had the highest gross margin in 2023?",
-        "Compare the R&D spending as a percentage of revenue across all three companies in 2023"
-    ]
+    def _extract_metric_type(self, query: str) -> str:
+        """Extract the type of metric being queried"""
+        query_lower = query.lower()
+        
+        for metric, keywords in self.metrics.items():
+            if any(keyword in query_lower for keyword in keywords):
+                return metric
+        
+        return 'general'
     
-    try:
-        # Initialize components
-        print("\n1. Initializing Data Collector...")
-        collector = SECDataCollector()
+    def _generate_structured_analysis(self, query: str, structured_data: dict) -> str:
+        """Generate analysis from structured table data"""
+        query_lower = query.lower()
         
-        print("\n2. Collecting SEC Filings...")
-        # For demo purposes, we'll assume some files exist or create mock data
-        # In real implementation, uncomment the next line:
-        # all_files = collector.collect_all_filings()
+        if not structured_data:
+            return "Unable to find sufficient structured data to answer the query."
         
-        print("\n3. Processing Documents...")
-        processor = DocumentProcessor()
+        # Different analysis patterns based on query type
+        if 'compare' in query_lower or 'which company' in query_lower:
+            return self._generate_table_comparison(structured_data)
+        elif 'grow' in query_lower or 'growth' in query_lower:
+            return self._generate_table_growth_analysis(structured_data)
+        elif 'breakdown' in query_lower or 'segment' in query_lower:
+            return self._generate_segment_analysis(structured_data)
+        else:
+            return self._generate_table_direct_answer(structured_data)
+    
+    def _generate_table_comparison(self, structured_data: dict) -> str:
+        """Generate comparison from table data"""
+        company_metrics = {}
         
-        # Create some mock documents for demo
-        mock_documents = []
-        for company in ['GOOGL', 'MSFT', 'NVDA']:
-            for year in ['2022', '2023', '2024']:
-                # In real implementation, you would process actual files
-                mock_content = f"""
-                {company} Annual Report {year}
-                
-                Total revenue for fiscal year {year} was ${'100' if company == 'GOOGL' else '80' if company == 'MSFT' else '60'} billion.
-                Operating margin improved to {'29.8' if company == 'GOOGL' else '42.1' if company == 'MSFT' else '32.5'}% in {year}.
-                
-                Research and development expenses were ${'25' if company == 'GOOGL' else '20' if company == 'MSFT' else '15'} billion, 
-                representing {'16' if company == 'GOOGL' else '14' if company == 'MSFT' else '18'}% of total revenue.
-                
-                Cloud revenue {'Google Cloud generated $26 billion' if company == 'GOOGL' else 
-                'Microsoft Azure and cloud services revenue was $45 billion' if company == 'MSFT' else 
-                'Data center revenue was $47 billion'} in fiscal {year}.
-                """
-                
-                doc = Document(
-                    content=mock_content,
-                    company=company,
-                    year=year,
-                    chunk_id=f"{company}_{year}_mock"
-                )
-                mock_documents.append(doc)
-        
-        print(f"Created {len(mock_documents)} mock document chunks")
-        
-        print("\n4. Building Vector Store...")
-        vector_store = VectorStore()
-        vector_store.add_documents(mock_documents)
-        
-        print("\n5. Initializing Financial Agent...")
-        agent = FinancialAgent(vector_store)
-        
-        print("\n6. Testing Queries...")
-        print("=" * 50)
-        
-        for i, query in enumerate(test_queries, 1):
-            print(f"\n🔍 Query {i}: {query}")
-            print("-" * 40)
+        for key, data in structured_data.items():
+            company, year = key.split('_')
             
-            try:
-                result = agent.process_query(query)
-                
-                print(f"💡 Answer: {result.answer}")
-                print(f"🧠 Reasoning: {result.reasoning}")
-                print(f"📋 Sub-queries: {', '.join(result.sub_queries)}")
-                print(f"📚 Sources: {len(result.sources)} documents")
-                
-                # Show JSON output
-                result_json = asdict(result)
-                print(f"\n📄 JSON Response:")
-                print(json.dumps(result_json, indent=2))
-                
-            except Exception as e:
-                print(f"❌ Error processing query: {e}")
+            for metric, values in data.items():
+                if 'value' in values:
+                    if company not in company_metrics:
+                        company_metrics[company] = {}
+                    
+                    company_metrics[company][metric] = values
+        
+        if not company_metrics:
+            return "Unable to extract comparable metrics from the data."
+        
+        # Create comparison for the first available metric
+        first_metric = list(list(company_metrics.values())[0].keys())[0]
+        comparison_data = {}
+        
+        for company, metrics in company_metrics.items():
+            if first_metric in metrics:
+                comparison_data[company] = metrics[first_metric]['value']
+        
+        if comparison_data:
+            sorted_companies = sorted(comparison_data.items(), key=lambda x: x[1], reverse=True)
+            winner = sorted_companies[0]
             
-            print("\n" + "=" * 50)
-        
-        print("\n✅ Financial RAG System Demo Complete!")
-        print("\nTo run with real SEC data:")
-        print("1. Uncomment the data collection lines")
-        print("2. Install additional dependencies: pip install beautifulsoup4 lxml")
-        print("3. Wait for SEC filings to download")
-        
-    except Exception as e:
-        print(f"❌ Error in main execution: {e}")
-        logger.error(f"Main execution error: {e}")
-
-if __name__ == "__main__":
-    main()
+            answer = f"Based on table analysis: {winner[0]} leads with {winner[1]}"
+            
+            # Add unit information
+            sample_data = list(company_metrics.values())[0][first_metric]
+            if sample_data.get('type') == 'percentage':
+                answer += "%"
+            elif sample_data.get('unit'):
+                answer += f" {sample_data['unit']}"
+            
+            # Add other companies
+            if len(sorted_companies) > 1:
+                others = [f"{comp}: {val}" for comp, val in sorted_companies[1:]]
+                if sample_data.get('type') == 'percentage':
+                    others = [f"{comp}: {val}%" for comp, val in sorted_companies[1:]]
+                elif sample_data.get('unit'):
+                    others = [f"{comp}: {val} {sample_data['unit']}" for comp, val in sorted_companies[1:]]
+                answer += f", followed by {', '.join(others)}"
+            
+            return answer
